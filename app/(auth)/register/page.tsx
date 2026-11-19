@@ -1,0 +1,57 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { AuthCard } from "@/components/layout/auth-card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { useToast } from "@/components/ui/toast";
+import { useAuth } from "@/lib/auth/auth-provider";
+import { authErrorKey } from "@/lib/auth/errors";
+import { useI18n } from "@/lib/i18n/provider";
+import { registerDoctor } from "@/services/auth.service";
+
+export default function RegisterPage() {
+  const { t } = useI18n();
+  const { show } = useToast();
+  const { configured } = useAuth();
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({ fullName: "", specialty: "", phone: "", email: "", password: "", clinicName: "" });
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await registerDoctor({ ...form, email: form.email.trim() });
+      router.replace("/dashboard");
+    } catch (err) {
+      show("error", t(authErrorKey(err)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AuthCard title={t("auth.register")}>
+      <form onSubmit={onSubmit} className="space-y-4">
+        <Input label={t("auth.fullName")} required value={form.fullName} onChange={set("fullName")} autoComplete="name" />
+        <Input label={t("auth.specialty")} required value={form.specialty} onChange={set("specialty")} />
+        <Input label={t("auth.phone")} type="tel" required value={form.phone} onChange={set("phone")} autoComplete="tel" dir="ltr" />
+        <Input label={t("auth.clinic")} value={form.clinicName} onChange={set("clinicName")} />
+        <Input label={t("auth.email")} type="email" required value={form.email} onChange={set("email")} autoComplete="email" dir="ltr" />
+        <Input label={t("auth.password")} type="password" required minLength={8} value={form.password} onChange={set("password")} autoComplete="new-password" dir="ltr" />
+        <Button type="submit" size="lg" className="w-full" loading={busy} disabled={!configured}>
+          {t("auth.register")}
+        </Button>
+      </form>
+      <p className="text-center text-sm text-muted">
+        {t("auth.haveAccount")}{" "}
+        <Link href="/login" className="font-semibold text-secondary">{t("auth.login")}</Link>
+      </p>
+    </AuthCard>
+  );
+}

@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    // Admin is granted ONLY through a custom claim set by the Admin SDK (scripts/set-admin.mjs).
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    // The server sets a `disabled` claim (and revokes tokens) when an admin disables an account.
+    function isActive() { return signedIn() && request.auth.token.get('disabled', false) != true; }
+    function isDoctor(uid) { return isOwner(uid) && isActive(); }
+
+    function str(v, max) { return v is string && v.size() <= max; }
+
+    /* ---------- profiles ---------- */
+    match /users/{uid} {
+      allow read: if (isOwner(uid) && isActive()) || isAdmin();
+      // A new account cannot grant itself a role or status.
+      allow create: if isOwner(uid)
+        && !('role' in request.resource.data)
+        && !('status' in request.resource.data);
+      allow update: if (isDoctor(uid)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'status', 'uid', 'createdAt']))
+        || isAdmin();
+      allow delete: if false;
+    }
+
+    /* ---------- everything private to one doctor ---------- */
+    match /doctors/{doctorId} {
+      allow read, write: if false;
+
+      // Patients are archived, never deleted.
+      match /patients/{id} {
+        allow read, create, update: if isDoctor(doctorId);
+        allow delete: if false;
+      }
+      // Sessions are soft-deleted (deletedAt), never removed.
+      match /sessions/{id} {
+        allow read, create, update: if isDoctor(doctorId);
+        allow delete: if false;
+      }
+      match /measurements/{id} {
+        allow read, create, update: if isDoctor(doctorId);
+        allow delete: if false;
+      }
+      // Filled-in template records are part of the medical record.
+      match /records/{id} {
+        allow read, create, update: if isDoctor(doctorId);
+        allow delete: if false;
+      }
+      // Append-only logs.
+      match /activities/{id} {
+        allow read, create: if isDoctor(doctorId);
+        allow update, delete: if false;
+      }
+      match /auditLog/{id} {
+        allow read, create: if isDoctor(doctorId);
+        allow update, delete: if false;
+      }
+      // Only drafts may be deleted; published plans are archived instead.
+      match /treatmentPlans/{id} {
+        allow read, create, update: if isDoctor(doctorId);
+        allow delete: if isDoctor(doctorId) && resource.data.status == 'draft';
+      }
+      match /patientFiles/{id} {
+        allow read, create, update, delete: if isDoctor(doctorId);
+      }
+      match /exercises/{id} {
+        allow read, write: if isDoctor(doctorId);
+      }
+      match /categories/{id} {
+        allow read, write: if isDoctor(doctorId);
+      }
+      match /templates/{id} {
+        allow read, write: if isDoctor(doctorId);
+      }
+      match /appointments/{id} {
+        allow read, write: if isDoctor(doctorId);
+      }
+    }
+
+    /* ---------- public library: readable by signed-in users, written by admins ---------- */
+    match /publicExercises/{id} {
+      allow read: if signedIn() && isActive();
+      allow write: if isAdmin();
+    }
+    match /publicCategories/{id} {
+      allow read: if signedIn() && isActive();
+      allow write: if isAdmin();
+    }
+
+    /* ---------- exercise reports ---------- */
+    match /reports/{id} {
+      allow create: if isActive() && request.resource.data.doctorId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && str(request.resource.data.reason, 1000);
+      allow read, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    /* ---------- platform settings ---------- */
+    match /platform/{doc} {
+      allow read: if signedIn() && isActive();
+      allow write: if isAdmin();
+    }
+
+    /* ---------- sharing: written ONLY by server routes (Admin SDK bypasses rules) ---------- */
+    match /sharedPrograms/{id} {
+      allow read: if isActive() && resource.data.doctorId == request.auth.uid;
+      allow write: if false;
+    }
+    match /programCompletions/{id} {
+      allow read: if isActive() && resource.data.doctorId == request.auth.uid;
+      allow write: if false;
+    }
+    // PIN hashes and lockout counters: no client access at all.
+    match /sharedSecrets/{id} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,18 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Private patient files: only the owning doctor, images/PDF, up to 10 MB.
+    match /doctors/{doctorId}/patients/{patientId}/files/{fileName} {
+      allow read, delete: if request.auth != null
+        && request.auth.uid == doctorId
+        && request.auth.token.get('disabled', false) != true;
+      allow create: if request.auth != null
+        && request.auth.uid == doctorId
+        && request.auth.token.get('disabled', false) != true
+        && request.resource.size < 10 * 1024 * 1024
+        && (request.resource.contentType.matches('image/.*') || request.resource.contentType == 'application/pdf');
+      allow update: if false;
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}
