@@ -1,0 +1,36 @@
+rules_version = '2';
+// REVIEW BEFORE DEPLOYING. Needs Firestore access from Storage rules (firestore.get) for the patient lookup.
+service firebase.storage {
+  match /b/{bucket}/o {
+    function active() { return request.auth != null && request.auth.token.get('disabled', false) != true; }
+    function inClinic(cid) { return active() && request.auth.token.get('clinicId', '') == cid; }
+    function isManager(cid) { return inClinic(cid) && request.auth.token.get('role', '') == 'manager'; }
+    function patientDoc(cid, pid) { return firestore.get(/databases/(default)/documents/clinics/$(cid)/patients/$(pid)).data; }
+    function mayOpenPatient(cid, pid) {
+      return isManager(cid) || (inClinic(cid) && request.auth.token.get('role', '') == 'doctor'
+        && patientDoc(cid, pid).assignedDoctorId == request.auth.uid);
+    }
+
+    // Patient files: manager, or the doctor currently assigned to the patient. Images/PDF up to 10 MB.
+    match /clinics/{cid}/patients/{pid}/files/{fileName} {
+      allow read, delete: if mayOpenPatient(cid, pid);
+      allow create: if mayOpenPatient(cid, pid)
+        && request.resource.size < 10 * 1024 * 1024
+        && (request.resource.contentType.matches('image/.*') || request.resource.contentType == 'application/pdf');
+      allow update: if false;
+    }
+
+    // Clinic logo: members read, manager writes (image up to 1 MB).
+    match /clinics/{cid}/branding/logo {
+      allow read: if inClinic(cid);
+      allow write: if isManager(cid) && request.resource.size < 1024 * 1024 && request.resource.contentType.matches('image/(png|jpeg|webp)');
+    }
+
+    // LEGACY files (pre-clinics): read-only for the owning account until migration is verified.
+    match /doctors/{doctorId}/patients/{patientId}/files/{fileName} {
+      allow read: if active() && request.auth.uid == doctorId;
+      allow write: if false;
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

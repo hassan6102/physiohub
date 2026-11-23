@@ -1,0 +1,181 @@
+rules_version = '2';
+// PhysioHub multi-clinic rules. REVIEW BEFORE DEPLOYING (see README "Deploying the clinics update").
+// Model: custom claims `clinicId` + `role` (set only by the Admin SDK) identify the member's clinic and role.
+// Clinic data lives at clinics/{clinicId}/...; a doctor reaches a record only if assignedDoctorId == their uid.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function isOwner(u) { return signedIn() && uid() == u; }
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    function isActive() { return signedIn() && request.auth.token.get('disabled', false) != true; }
+    function str(v, max) { return v is string && v.size() <= max; }
+
+    function inClinic(cid) { return isActive() && request.auth.token.get('clinicId', '') == cid; }
+    function isManager(cid) { return inClinic(cid) && request.auth.token.get('role', '') == 'manager'; }
+    function isDoctorIn(cid) { return inClinic(cid) && request.auth.token.get('role', '') == 'doctor'; }
+    function base(cid) { return /databases/$(database)/documents/clinics/$(cid); }
+
+    // Who the record is assigned to, as stored (create) / before the change (update).
+    function mine(d) { return d.assignedDoctorId == uid(); }
+    // A user the manager may assign patients to: same clinic, not disabled, doctor or practicing manager.
+    function assignable(cid, a) {
+      let u = get(/databases/$(database)/documents/users/$(a)).data;
+      return u.clinicId == cid && u.get('status', 'active') != 'disabled'
+        && (u.role == 'doctor' || (u.role == 'manager' && u.get('practicing', false) == true));
+    }
+    function patientOf(cid, pid) { return get(/databases/$(database)/documents/clinics/$(cid)/patients/$(pid)).data; }
+
+    // Fields that never change on update.
+    function immutable(cid) {
+      return request.resource.data.clinicId == cid
+        && request.resource.data.clinicId == resource.data.clinicId
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.assignedDoctorId == resource.data.assignedDoctorId;
+    }
+    // A child record (session, measurement, ...) created under a patient inherits that patient's assignee.
+    function childCreate(cid) {
+      let d = request.resource.data;
+      return inClinic(cid) && d.clinicId == cid && d.createdBy == uid()
+        && str(d.patientId, 128)
+        && d.assignedDoctorId == patientOf(cid, d.patientId).assignedDoctorId
+        && (isManager(cid) || d.assignedDoctorId == uid());
+    }
+    function childRead(cid) { return isManager(cid) || (isDoctorIn(cid) && mine(resource.data)); }
+    function childUpdate(cid) { return (isManager(cid) || (isDoctorIn(cid) && mine(resource.data))) && immutable(cid); }
+
+    /* ---------- profiles ---------- */
+    match /users/{u} {
+      allow read: if (isOwner(u) && isActive()) || isAdmin()
+        || (isManager(resource.data.get('clinicId', '__none__')));
+      // Profiles are created by server routes only (clinic creation / invitation accept).
+      allow create: if false;
+      // A user edits only personal fields; membership fields are server-managed.
+      allow update: if (isOwner(u) && isActive()
+        && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['role', 'status', 'uid', 'createdAt', 'clinicId', 'practicing', 'email']))
+        || isAdmin();
+      allow delete: if false;
+    }
+
+    /* ---------- clinics ---------- */
+    match /clinics/{cid} {
+      allow read: if inClinic(cid) || isAdmin();
+      allow update: if isManager(cid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'logoUrl', 'phone', 'email', 'address'])
+        && str(request.resource.data.name, 120);
+      allow create, delete: if false;
+
+      match /patients/{id} {
+        allow read: if childRead(cid);
+        // A doctor can only create a patient assigned to themselves; a manager picks an assignable member.
+        allow create: if inClinic(cid)
+          && request.resource.data.clinicId == cid
+          && request.resource.data.createdBy == uid()
+          && ((isDoctorIn(cid) && request.resource.data.assignedDoctorId == uid())
+              || (isManager(cid) && assignable(cid, request.resource.data.assignedDoctorId)));
+        // Reassignment is NOT possible from the client: assignedDoctorId is immutable here; transfer is a server API.
+        allow update: if childUpdate(cid);
+        allow delete: if false;
+      }
+      match /sessions/{id} {
+        allow read: if childRead(cid);
+        allow create: if childCreate(cid);
+        allow update: if childUpdate(cid);
+        allow delete: if false;
+      }
+      match /measurements/{id} {
+        allow read: if childRead(cid);
+        allow create: if childCreate(cid);
+        allow update: if childUpdate(cid);
+        allow delete: if false;
+      }
+      match /records/{id} {
+        allow read: if childRead(cid);
+        allow create: if childCreate(cid);
+        allow update: if childUpdate(cid);
+        allow delete: if false;
+      }
+      match /appointments/{id} {
+        allow read: if childRead(cid);
+        allow create: if childCreate(cid);
+        allow update: if childUpdate(cid);
+        allow delete: if false;
+      }
+      match /treatmentPlans/{id} {
+        allow read: if childRead(cid);
+        allow create: if childCreate(cid);
+        allow update: if childUpdate(cid);
+        allow delete: if childUpdate(cid) && resource.data.status == 'draft';
+      }
+      match /patientFiles/{id} {
+        allow read: if childRead(cid);
+        allow create: if childCreate(cid);
+        allow update: if childUpdate(cid);
+        allow delete: if childRead(cid);
+      }
+      // Append-only logs. The manager reads everything; a doctor reads entries they authored.
+      match /activities/{id} {
+        allow read: if isManager(cid) || (isDoctorIn(cid) && resource.data.actorId == uid());
+        allow create: if inClinic(cid) && request.resource.data.actorId == uid() && request.resource.data.get('clinicId', cid) == cid;
+        allow update, delete: if false;
+      }
+      match /auditLog/{id} {
+        allow read: if isManager(cid) || (isDoctorIn(cid) && resource.data.actorId == uid());
+        allow create: if inClinic(cid) && request.resource.data.actorId == uid();
+        allow update, delete: if false;
+      }
+    }
+
+    /* ---------- invitations: server only; the manager can list their clinic's ---------- */
+    match /invites/{id} {
+      allow read: if isManager(resource.data.get('clinicId', '__none__'));
+      allow write: if false;
+    }
+
+    /* ---------- personal library (exercises/categories/templates) stays per account ---------- */
+    match /doctors/{doctorId} {
+      allow read, write: if false;
+      match /exercises/{id} { allow read, write: if isOwner(doctorId) && isActive(); }
+      match /categories/{id} { allow read, write: if isOwner(doctorId) && isActive(); }
+      match /templates/{id} { allow read, write: if isOwner(doctorId) && isActive(); }
+
+      // LEGACY (pre-clinics) clinical data: read-only for the owner until migration is verified.
+      match /{legacy}/{id} {
+        allow read: if isOwner(doctorId) && isActive()
+          && legacy in ['patients', 'sessions', 'measurements', 'records', 'treatmentPlans', 'patientFiles', 'appointments', 'activities', 'auditLog'];
+        allow write: if false;
+      }
+    }
+
+    /* ---------- public library: readable by signed-in users, written by admins ---------- */
+    match /publicExercises/{id} { allow read: if isActive(); allow write: if isAdmin(); }
+    match /publicCategories/{id} { allow read: if isActive(); allow write: if isAdmin(); }
+
+    match /reports/{id} {
+      allow create: if isActive() && request.resource.data.doctorId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && str(request.resource.data.reason, 1000);
+      allow read, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /platform/{doc} { allow read: if isActive(); allow write: if isAdmin(); }
+
+    /* ---------- sharing: written ONLY by server routes ---------- */
+    match /sharedPrograms/{id} {
+      allow read: if isManager(resource.data.get('clinicId', '__none__'))
+        || (isDoctorIn(resource.data.get('clinicId', '__none__')) && resource.data.get('assignedDoctorId', '') == uid());
+      allow write: if false;
+    }
+    match /programCompletions/{id} {
+      allow read: if isManager(resource.data.get('clinicId', '__none__'))
+        || (isDoctorIn(resource.data.get('clinicId', '__none__')) && resource.data.get('assignedDoctorId', '') == uid());
+      allow write: if false;
+    }
+    match /sharedSecrets/{id} { allow read, write: if false; }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
